@@ -1,0 +1,20 @@
+# Metabase collection: Commission
+#
+# This file is intended to be populated by Metabase Pro's "Version
+# Control with Git" feature on first sync. After enabling Git sync in
+# Metabase (Admin > Settings > Version Control), point Metabase at this
+# repo on the branch `claude/metabase-commission-dashboard-yvKW6` (or
+# whichever branch you settle on) with this directory as the collection
+# root. Metabase will then write its canonical YAML (cards, dashboards,
+# parameters) into this directory on each export and read them back on
+# each import.
+#
+# The seed metadata below is a minimal placeholder; Metabase will
+# overwrite it on first export.
+
+name: Commission
+description: |
+  Staff commission tracking per the DOS & Co. Commission Plan
+  (effective 1 July 2024). Sources: dospay.public.fees_transactions and
+  dospay.public.int_quarterly via views in the `commission` schema.
+slug: commission
