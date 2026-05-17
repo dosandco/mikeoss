@@ -1,298 +1,251 @@
 -- =====================================================================
 -- Commission super-query.
 --
--- Single SELECT that returns commission-relevant data at the finest
--- sensible grain: one row per
---   (month, dp_account, role, staff_email)
--- where role is one of brought_in / managed / supervised / introducer.
--- Use as the source for any summary table on the commission dashboard
--- (per-staff, per-quarter, per-FY etc. — all by aggregation).
+-- Single SELECT at one row per (month, dp_account, role, staff) that
+-- exposes everything needed to build commission summary tables by
+-- aggregation. Designed to be the only source the dashboard queries
+-- against.
 --
--- Output columns
---   Period dimensions:
---     month_start, month_end, month_label             (the grain)
---     calendar_quarter_start, _end, _label            (Jan-Mar etc.)
---     plan_fy_year, plan_quarter_num, plan_quarter_label,
+-- The model
+-- ---------
+-- For each (month, dp_account):
+--   * fees     = SUM(fees_transactions.net_amount) on that account, that month
+--   * interest = monthly_interest * carry, where:
+--                  - monthly_interest is read from int_monthly
+--                    (populated by the official monthly_interest_accrual
+--                    query; treated here as gross client interest)
+--                  - carry is the firm's share of gross interest, by
+--                    (bank, currency, genre, date). Today all production
+--                    data is bol/GBP, so the carry rules are inlined for
+--                    that case. When ClearBank/Federated Hermes go live
+--                    OR int_monthly is enriched with a dp_interest
+--                    column, simplify the monthly_interest CTE below to
+--                    read it directly.
+--
+-- The dp_account row tells us who fills each attribution slot:
+--   * dp_introduced    -> 'brought_in' role
+--   * dp_managing      -> 'managed' role
+--   * dp_supervising   -> 'supervised' role
+--   * ext_introducer   -> 'introducer' role
+--
+-- sys_commission_users gives each staff member:
+--   * one rate per role (brought_in, managed, supervised, introducer)
+--   * a commission_multiple
+--   * a quarterly min_threshold
+--   * introducer_months (caps the introducer's earning window)
+--
+-- The final commission on a row is simply:
+--   (fees + interest) * row_rate * row_multiple
+--
+-- where row_rate is the staff member's rate for the row's role.
+--
+-- Period dimensions
+-- -----------------
+-- Output is at month grain. Each row carries:
+--   * month_start, month_end
+--   * plan_fy_year, plan_quarter_num, plan_quarter_label,
 --     plan_quarter_start, plan_quarter_end, plan_payable_date
---                                                     (DOS commission
---                                                      plan quarters,
---                                                      FY ending 30 Nov)
---   Account dimensions:
---     account_id, account_title, bank, currency, genre
---   Attribution:
---     role            'brought_in' / 'managed' / 'supervised' / 'introducer'
---     staff_email, staff_display, staff_type
---   Raw bases:
---     fees_attributed         net_amount sum from fees_transactions on
---                             this dp_account in this month
---     interest_attributed     monthly_interest from int_monthly on
---                             this dp_account in this month
---   Rate inputs from sys_commission_users:
---     commission_rate         the staff's rate for this specific role
---     commission_multiple     the staff's multiple
---     quarterly_threshold     the staff's min_threshold (per quarter)
---     within_introducer_window   external introducers only earn for
---                                introducer_months from account opening
---   Calculated:
---     commission_on_fees     = fees_attributed * rate * multiple
---     commission_on_interest = interest_attributed * rate * multiple
---     commission_total       = commission_on_fees + commission_on_interest
---   Gating:
---     within_plan_period      month_start >= 2024-07-01
---
--- Assumptions / design choices to verify
---   1. Interest commission uses the same role rate as fees (the
---      commission letter does not list a separate interest rate).
---      The interest base is int_monthly.monthly_interest (the firm-
---      side amount written by the monthly accrual). If the rate
---      should instead apply to gross client interest, swap the
---      interest_by_month source accordingly.
---   2. The per-role pre-split columns on int_monthly
---      (dp_introduced / dp_managing / dp_supervising) are NOT used.
---      They're sparse (populated on 31 of 872 rows) and the values
---      do not reconcile with monthly_interest. Once their meaning is
---      clarified, we can either drop them upstream or wire them in
---      as the canonical interest commission base.
---   3. int_monthly is deduplicated by picking the most recent
---      created_at per (month_start, dp_account). Older rows (from
---      before the multi-bank refactor) coexist with the new
---      <month>_<account>_<bank>_<currency> rows; we keep the latest.
---   4. fees_transactions are aggregated by date::date and
---      dp_account. Rows with NULL dp_account or NULL date are
---      excluded. account_type = 'SALES' only.
---   5. Bank lookup uses bank_account_sub.dp_account -> bank, taking
---      one bank per dp_account. A dp_account that operates across
---      multiple banks is not yet split by bank here; that's a
---      downstream concern when the data starts to require it.
+-- per the DOS commission plan (FY ending 30 Nov; quarters end
+-- 28 Feb, 30 May, 31 Aug, 30 Nov; paid in the second calendar month
+-- following). Calendar quarters are not exposed - the plan's
+-- fiscal quarters are what the dashboard cares about.
 -- =====================================================================
 
 WITH params AS (
-    SELECT
-        DATE '2024-07-01'                              AS plan_effective_from,
-        date_trunc('month', current_date)::date        AS through_month
+    SELECT DATE '2024-07-01'                       AS plan_effective_from,
+           date_trunc('month', current_date)::date AS through_month
 ),
 months AS (
     SELECT m::date AS month_start
     FROM params,
          generate_series(plan_effective_from, through_month, interval '1 month') AS m
 ),
-fees_by_month AS (
+-- Monthly fees per account, gross of carry, net of VAT (= net_amount).
+monthly_fees AS (
     SELECT
         date_trunc('month', date::date)::date AS month_start,
         dp_account                            AS account_id,
-        SUM(net_amount)                       AS fees_net
+        SUM(net_amount)                       AS fees
     FROM fees_transactions
     WHERE date IS NOT NULL
       AND account_type = 'SALES'
       AND dp_account IS NOT NULL
     GROUP BY 1, 2
 ),
--- Deduplicate int_monthly: pick the most recent row per (month, account).
--- Old rows (id = "<month>_<account>") coexist with new multi-bank rows
--- (id = "<month>_<account>_<bank>_<currency>") and can hold stale values.
-interest_by_month AS (
-    SELECT DISTINCT ON (month_start, dp_account)
-        month_start::date                AS month_start,
-        dp_account::uuid                 AS account_id,
-        COALESCE(monthly_interest, 0)    AS monthly_interest
-    FROM int_monthly
-    ORDER BY month_start, dp_account, created_at DESC
-),
-account_dimensions AS (
-    SELECT
-        a.id                            AS account_id,
-        a.title                         AS account_title,
-        a.currency                      AS currency,
-        pat.genre                       AS genre,
-        a.dp_introduced                 AS introduced_email,
-        a.dp_managing                   AS managing_email,
-        a.dp_supervising                AS supervising_email,
-        a.ext_introducer                AS introducer_email,
-        a.created_at::date              AS account_created_at,
-        (SELECT bank FROM bank_account_sub WHERE dp_account = a.id LIMIT 1) AS bank
-    FROM dp_account a
+-- Monthly interest per account, after carry.
+--
+-- int_monthly currently has duplicate rows per (month, account) from
+-- the pre/post multi-bank refactor; DISTINCT ON keeps the most recent.
+-- Carry is the BoL GBP rule by genre and date; this matches every
+-- account in production today. When ClearBank/FH go live, replace
+-- the inline CASE with a join to the bank/currency/date carry rules
+-- already in the official interest accrual queries.
+monthly_interest AS (
+    SELECT DISTINCT ON (im.month_start, im.dp_account)
+        im.month_start::date                  AS month_start,
+        a.id                                  AS account_id,
+        COALESCE(im.monthly_interest, 0)      AS interest_gross,
+        COALESCE(im.monthly_interest, 0)
+          * CASE pat.genre
+              WHEN 'Deposit Accounts'  THEN 0.10
+              WHEN 'Escrow Accounts'   THEN
+                  CASE WHEN im.month_start >= DATE '2025-03-01' THEN 0.75 ELSE 0.50 END
+              WHEN 'Payment Accounts'  THEN
+                  CASE WHEN im.month_start >= DATE '2025-03-01' THEN 0.75 ELSE 0.50 END
+              ELSE 0
+            END                               AS interest_firm
+    FROM int_monthly im
+    JOIN dp_account a            ON a.id::text = im.dp_account
     LEFT JOIN dp_account_type pat ON a.type = pat.id
+    ORDER BY im.month_start, im.dp_account, im.created_at DESC
 ),
--- One row per (month, account) with fees, interest and the staff
--- emails attached.
-attribution AS (
+-- One row per (month, account) with attribution emails and both bases.
+account_month AS (
     SELECT
         m.month_start,
-        ad.account_id,
-        ad.account_title,
-        ad.bank,
-        ad.currency,
-        ad.genre,
-        ad.account_created_at,
-        ad.introduced_email,
-        ad.managing_email,
-        ad.supervising_email,
-        ad.introducer_email,
-        COALESCE(fbm.fees_net, 0)         AS fees_attributed,
-        COALESCE(ibm.monthly_interest, 0) AS interest_attributed
+        a.id                                       AS account_id,
+        a.title                                    AS account_title,
+        a.currency                                 AS currency,
+        a.created_at::date                         AS account_opened,
+        pat.genre                                  AS genre,
+        (SELECT bank FROM bank_account_sub
+          WHERE dp_account = a.id LIMIT 1)         AS bank,
+        a.dp_introduced                            AS staff_introduced,
+        a.dp_managing                              AS staff_managing,
+        a.dp_supervising                           AS staff_supervising,
+        a.ext_introducer                           AS staff_introducer,
+        COALESCE(mf.fees, 0)                       AS fees,
+        COALESCE(mi.interest_firm, 0)              AS interest
     FROM months m
-    CROSS JOIN account_dimensions ad
-    LEFT JOIN fees_by_month     fbm ON fbm.month_start = m.month_start AND fbm.account_id = ad.account_id
-    LEFT JOIN interest_by_month ibm ON ibm.month_start = m.month_start AND ibm.account_id = ad.account_id
+    CROSS JOIN dp_account a
+    LEFT JOIN dp_account_type pat ON a.type = pat.id
+    LEFT JOIN monthly_fees      mf ON mf.month_start = m.month_start AND mf.account_id = a.id
+    LEFT JOIN monthly_interest  mi ON mi.month_start = m.month_start AND mi.account_id = a.id
 ),
--- Explode each (month, account) into one row per attributed role.
+-- Explode into one row per attributed role.
 exploded AS (
-    SELECT month_start, account_id, account_title, bank, currency, genre, account_created_at,
-           'brought_in'::text AS role, introduced_email AS staff_email,
-           fees_attributed, interest_attributed
-    FROM attribution WHERE introduced_email IS NOT NULL
+    SELECT month_start, account_id, account_title, bank, currency, genre, account_opened,
+           'brought_in'::text AS role, staff_introduced  AS staff_email, fees, interest
+    FROM account_month WHERE staff_introduced IS NOT NULL
 
     UNION ALL
-    SELECT month_start, account_id, account_title, bank, currency, genre, account_created_at,
-           'managed', managing_email, fees_attributed, interest_attributed
-    FROM attribution WHERE managing_email IS NOT NULL
+    SELECT month_start, account_id, account_title, bank, currency, genre, account_opened,
+           'managed', staff_managing, fees, interest
+    FROM account_month WHERE staff_managing IS NOT NULL
 
     UNION ALL
-    SELECT month_start, account_id, account_title, bank, currency, genre, account_created_at,
-           'supervised', supervising_email, fees_attributed, interest_attributed
-    FROM attribution WHERE supervising_email IS NOT NULL
+    SELECT month_start, account_id, account_title, bank, currency, genre, account_opened,
+           'supervised', staff_supervising, fees, interest
+    FROM account_month WHERE staff_supervising IS NOT NULL
 
     UNION ALL
-    SELECT month_start, account_id, account_title, bank, currency, genre, account_created_at,
-           'introducer', introducer_email, fees_attributed, interest_attributed
-    FROM attribution WHERE introducer_email IS NOT NULL
-),
--- Resolve the rate / multiple for each row from sys_commission_users.
-rated AS (
-    SELECT
-        e.*,
-        u.display        AS staff_display,
-        u.type           AS staff_type,
-        u.multiple       AS commission_multiple_raw,
-        u.min_threshold  AS quarterly_threshold,
-        u.introducer_months,
-        CASE e.role
+    SELECT month_start, account_id, account_title, bank, currency, genre, account_opened,
+           'introducer', staff_introducer, fees, interest
+    FROM account_month WHERE staff_introducer IS NOT NULL
+)
+SELECT
+    -- Period dimensions
+    e.month_start,
+    (e.month_start + interval '1 month - 1 day')::date                         AS month_end,
+    TO_CHAR(e.month_start, 'YYYY-MM')                                          AS month_label,
+
+    -- DOS plan quarter (FY ending 30 Nov; Q1 ends 28 Feb)
+    CASE WHEN EXTRACT(MONTH FROM e.month_start) = 12
+         THEN EXTRACT(YEAR FROM e.month_start)::int + 1
+         ELSE EXTRACT(YEAR FROM e.month_start)::int
+    END                                                                        AS plan_fy_year,
+    CASE WHEN EXTRACT(MONTH FROM e.month_start) IN (12, 1, 2) THEN 1
+         WHEN EXTRACT(MONTH FROM e.month_start) IN (3, 4, 5)  THEN 2
+         WHEN EXTRACT(MONTH FROM e.month_start) IN (6, 7, 8)  THEN 3
+         ELSE 4
+    END                                                                        AS plan_quarter_num,
+    'FY' || (CASE WHEN EXTRACT(MONTH FROM e.month_start) = 12
+                  THEN EXTRACT(YEAR FROM e.month_start)::int + 1
+                  ELSE EXTRACT(YEAR FROM e.month_start)::int END)
+         || '-Q' || (CASE WHEN EXTRACT(MONTH FROM e.month_start) IN (12,1,2) THEN 1
+                          WHEN EXTRACT(MONTH FROM e.month_start) IN (3,4,5)  THEN 2
+                          WHEN EXTRACT(MONTH FROM e.month_start) IN (6,7,8)  THEN 3
+                          ELSE 4 END)                                          AS plan_quarter_label,
+    CASE WHEN EXTRACT(MONTH FROM e.month_start) IN (12,1,2)
+            THEN make_date(CASE WHEN EXTRACT(MONTH FROM e.month_start) = 12
+                                THEN EXTRACT(YEAR FROM e.month_start)::int
+                                ELSE EXTRACT(YEAR FROM e.month_start)::int - 1 END,
+                           12, 1)
+         WHEN EXTRACT(MONTH FROM e.month_start) IN (3,4,5)  THEN make_date(EXTRACT(YEAR FROM e.month_start)::int,  3, 1)
+         WHEN EXTRACT(MONTH FROM e.month_start) IN (6,7,8)  THEN make_date(EXTRACT(YEAR FROM e.month_start)::int,  6, 1)
+         ELSE                                                    make_date(EXTRACT(YEAR FROM e.month_start)::int,  9, 1)
+    END                                                                        AS plan_quarter_start,
+    CASE WHEN EXTRACT(MONTH FROM e.month_start) IN (12,1,2)
+            THEN (make_date(CASE WHEN EXTRACT(MONTH FROM e.month_start) = 12
+                                 THEN EXTRACT(YEAR FROM e.month_start)::int + 1
+                                 ELSE EXTRACT(YEAR FROM e.month_start)::int END,
+                            3, 1) - interval '1 day')::date
+         WHEN EXTRACT(MONTH FROM e.month_start) IN (3,4,5)  THEN make_date(EXTRACT(YEAR FROM e.month_start)::int,  5, 30)
+         WHEN EXTRACT(MONTH FROM e.month_start) IN (6,7,8)  THEN make_date(EXTRACT(YEAR FROM e.month_start)::int,  8, 31)
+         ELSE                                                    make_date(EXTRACT(YEAR FROM e.month_start)::int, 11, 30)
+    END                                                                        AS plan_quarter_end,
+    -- Payable on the usual payroll date in the second month after quarter end
+    CASE WHEN EXTRACT(MONTH FROM e.month_start) IN (12,1,2)
+            THEN make_date(CASE WHEN EXTRACT(MONTH FROM e.month_start) = 12
+                                THEN EXTRACT(YEAR FROM e.month_start)::int + 1
+                                ELSE EXTRACT(YEAR FROM e.month_start)::int END,
+                           4, 28)
+         WHEN EXTRACT(MONTH FROM e.month_start) IN (3,4,5)  THEN make_date(EXTRACT(YEAR FROM e.month_start)::int,  7, 28)
+         WHEN EXTRACT(MONTH FROM e.month_start) IN (6,7,8)  THEN make_date(EXTRACT(YEAR FROM e.month_start)::int, 10, 28)
+         ELSE                                                    make_date(EXTRACT(YEAR FROM e.month_start)::int + 1, 1, 28)
+    END                                                                        AS plan_payable_date,
+
+    -- Account dimensions
+    e.account_id,
+    e.account_title,
+    e.bank,
+    e.currency,
+    e.genre,
+
+    -- Attribution
+    e.role,
+    e.staff_email,
+    u.display AS staff_name,
+    u.type    AS staff_type,
+
+    -- Bases (the two columns the dashboard pivots from)
+    e.fees                                                                     AS fees,
+    e.interest                                                                 AS interest,
+
+    -- Rate and multiplier for THIS row's role
+    CASE e.role
+        WHEN 'brought_in' THEN u.brought_in
+        WHEN 'managed'    THEN u.managed
+        WHEN 'supervised' THEN u.supervised
+        WHEN 'introducer' THEN u.introducer
+    END                                                                        AS rate,
+    COALESCE(u.multiple, 1)                                                    AS multiple,
+    u.min_threshold                                                            AS quarterly_threshold,
+
+    -- External introducer earns only for introducer_months from account opening.
+    -- TRUE for the three staff roles; only constrains the introducer role.
+    CASE WHEN e.role <> 'introducer' THEN TRUE
+         WHEN u.introducer_months IS NULL OR u.introducer_months = 0 THEN TRUE
+         ELSE e.month_start <= (e.account_opened + (u.introducer_months || ' months')::interval)::date
+    END                                                                        AS within_introducer_window,
+
+    -- Final commission for this row
+    ROUND((
+        (e.fees + e.interest)
+        * COALESCE(CASE e.role
             WHEN 'brought_in' THEN u.brought_in
             WHEN 'managed'    THEN u.managed
             WHEN 'supervised' THEN u.supervised
             WHEN 'introducer' THEN u.introducer
-        END AS commission_rate_raw
-    FROM exploded e
-    LEFT JOIN sys_commission_users u ON lower(u.email) = lower(e.staff_email)
-)
-SELECT
-    -- Period dimensions: month grain
-    month_start,
-    (month_start + interval '1 month' - interval '1 day')::date           AS month_end,
-    TO_CHAR(month_start, 'YYYY-MM')                                        AS month_label,
+          END, 0)
+        * COALESCE(u.multiple, 1)
+        * CASE WHEN e.role = 'introducer'
+                AND u.introducer_months > 0
+                AND e.month_start > (e.account_opened + (u.introducer_months || ' months')::interval)::date
+               THEN 0 ELSE 1 END
+    )::numeric, 4)                                                             AS commission
 
-    -- Calendar quarter
-    DATE_TRUNC('quarter', month_start)::date                               AS calendar_quarter_start,
-    (DATE_TRUNC('quarter', month_start) + interval '3 months' - interval '1 day')::date
-                                                                           AS calendar_quarter_end,
-    EXTRACT(YEAR FROM month_start)::int || '-Q'
-        || EXTRACT(QUARTER FROM month_start)::int                         AS calendar_quarter_label,
-
-    -- DOS commission-plan quarter (FY ending 30 Nov, Q1 ends 28 Feb)
-    CASE WHEN EXTRACT(MONTH FROM month_start) = 12
-         THEN EXTRACT(YEAR FROM month_start)::int + 1
-         ELSE EXTRACT(YEAR FROM month_start)::int
-    END                                                                    AS plan_fy_year,
-    CASE WHEN EXTRACT(MONTH FROM month_start) IN (12, 1, 2) THEN 1
-         WHEN EXTRACT(MONTH FROM month_start) IN (3, 4, 5)  THEN 2
-         WHEN EXTRACT(MONTH FROM month_start) IN (6, 7, 8)  THEN 3
-         ELSE 4
-    END                                                                    AS plan_quarter_num,
-    'FY' || (CASE WHEN EXTRACT(MONTH FROM month_start) = 12
-                  THEN EXTRACT(YEAR FROM month_start)::int + 1
-                  ELSE EXTRACT(YEAR FROM month_start)::int END)
-         || '-Q' || (CASE WHEN EXTRACT(MONTH FROM month_start) IN (12, 1, 2) THEN 1
-                          WHEN EXTRACT(MONTH FROM month_start) IN (3, 4, 5)  THEN 2
-                          WHEN EXTRACT(MONTH FROM month_start) IN (6, 7, 8)  THEN 3
-                          ELSE 4 END)                                      AS plan_quarter_label,
-    CASE WHEN EXTRACT(MONTH FROM month_start) IN (12, 1, 2)
-            THEN make_date(
-                CASE WHEN EXTRACT(MONTH FROM month_start) = 12
-                     THEN EXTRACT(YEAR FROM month_start)::int
-                     ELSE EXTRACT(YEAR FROM month_start)::int - 1 END,
-                12, 1)
-         WHEN EXTRACT(MONTH FROM month_start) IN (3, 4, 5)
-            THEN make_date(EXTRACT(YEAR FROM month_start)::int, 3, 1)
-         WHEN EXTRACT(MONTH FROM month_start) IN (6, 7, 8)
-            THEN make_date(EXTRACT(YEAR FROM month_start)::int, 6, 1)
-         ELSE make_date(EXTRACT(YEAR FROM month_start)::int, 9, 1)
-    END                                                                    AS plan_quarter_start,
-    CASE WHEN EXTRACT(MONTH FROM month_start) IN (12, 1, 2)
-            THEN (make_date(
-                CASE WHEN EXTRACT(MONTH FROM month_start) = 12
-                     THEN EXTRACT(YEAR FROM month_start)::int + 1
-                     ELSE EXTRACT(YEAR FROM month_start)::int END,
-                3, 1) - interval '1 day')::date
-         WHEN EXTRACT(MONTH FROM month_start) IN (3, 4, 5)
-            THEN make_date(EXTRACT(YEAR FROM month_start)::int, 5, 30)
-         WHEN EXTRACT(MONTH FROM month_start) IN (6, 7, 8)
-            THEN make_date(EXTRACT(YEAR FROM month_start)::int, 8, 31)
-         ELSE make_date(EXTRACT(YEAR FROM month_start)::int, 11, 30)
-    END                                                                    AS plan_quarter_end,
-    -- Payable on the usual payroll date in the second month after
-    -- quarter end (per plan clause 8.1). Day-of-month fixed at 28 to
-    -- be calendar-safe; adjust to your actual payroll day if needed.
-    CASE WHEN EXTRACT(MONTH FROM month_start) IN (12, 1, 2)
-            THEN make_date(
-                CASE WHEN EXTRACT(MONTH FROM month_start) = 12
-                     THEN EXTRACT(YEAR FROM month_start)::int + 1
-                     ELSE EXTRACT(YEAR FROM month_start)::int END,
-                4, 28)
-         WHEN EXTRACT(MONTH FROM month_start) IN (3, 4, 5)
-            THEN make_date(EXTRACT(YEAR FROM month_start)::int, 7, 28)
-         WHEN EXTRACT(MONTH FROM month_start) IN (6, 7, 8)
-            THEN make_date(EXTRACT(YEAR FROM month_start)::int, 10, 28)
-         ELSE make_date(EXTRACT(YEAR FROM month_start)::int + 1, 1, 28)
-    END                                                                    AS plan_payable_date,
-
-    -- Account dimensions
-    account_id,
-    account_title,
-    bank,
-    currency,
-    genre,
-
-    -- Attribution
-    role,
-    staff_email,
-    staff_display,
-    staff_type,
-
-    -- Raw bases
-    fees_attributed,
-    interest_attributed,
-
-    -- Rate inputs
-    commission_rate_raw                              AS commission_rate,
-    COALESCE(commission_multiple_raw, 1)             AS commission_multiple,
-    quarterly_threshold,
-
-    -- External introducer cap (TRUE for staff roles; for the introducer
-    -- role, TRUE only while within introducer_months of account opening).
-    CASE WHEN role <> 'introducer' THEN TRUE
-         WHEN introducer_months IS NULL OR introducer_months = 0 THEN TRUE
-         ELSE month_start <= (account_created_at + (introducer_months || ' months')::interval)::date
-    END                                              AS within_introducer_window,
-
-    -- Plan effective gate
-    (month_start >= DATE '2024-07-01')               AS within_plan_period,
-
-    -- Computed commission components
-    ROUND((
-        fees_attributed
-        * COALESCE(commission_rate_raw, 0)
-        * COALESCE(commission_multiple_raw, 1)
-    )::numeric, 4)                                   AS commission_on_fees,
-    ROUND((
-        interest_attributed
-        * COALESCE(commission_rate_raw, 0)
-        * COALESCE(commission_multiple_raw, 1)
-    )::numeric, 4)                                   AS commission_on_interest,
-    ROUND((
-        (fees_attributed + interest_attributed)
-        * COALESCE(commission_rate_raw, 0)
-        * COALESCE(commission_multiple_raw, 1)
-    )::numeric, 4)                                   AS commission_total
-FROM rated
-WHERE month_start >= DATE '2024-07-01'
-ORDER BY staff_email, month_start, account_id, role;
+FROM exploded e
+LEFT JOIN sys_commission_users u ON lower(u.email) = lower(e.staff_email)
+WHERE e.month_start >= DATE '2024-07-01'
+ORDER BY e.staff_email, e.month_start, e.account_id, e.role;
