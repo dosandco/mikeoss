@@ -59,11 +59,28 @@
 --   staff_email, staff_name, staff_type              recipient
 --   commission_multiple, quarterly_threshold         from
 --                                                    sys_commission_users
---   introduced     commission earned in the brought_in role
+--   qualifying_fees                                  sum of
+--                                                    fees_transactions.net_amount
+--                                                    on the accounts where
+--                                                    this staff is attributed
+--                                                    in any role this month
+--                                                    (counted once per
+--                                                    account). This is the
+--                                                    base the quarterly
+--                                                    threshold tests against.
+--   qualifying_interest                              same, for the firm-
+--                                                    share interest base.
+--   introduced     commission earned in the brought_in role (fees + interest)
 --   managing       commission earned in the managed role
 --   supervising    commission earned in the supervised role
 --   external       commission earned as ext_introducer (capped by
 --                  introducer_months from account opening)
+--   commission_on_fees       commission from fees only, across all four
+--                            roles (fees * role_rate * multiple, summed)
+--   commission_on_interest   commission from interest only, across all
+--                            four roles
+--                            commission_on_fees + commission_on_interest
+--                            = introduced + managing + supervising + external
 --   month_total    sum of the four role columns
 --   cumulative     running sum of month_total per (staff, currency),
 --                  since the plan effective date (no FY reset)
@@ -186,6 +203,8 @@ per_staff_month AS (
         u.type          AS staff_type,
         u.multiple      AS commission_multiple,
         u.min_threshold AS quarterly_threshold,
+        -- Role-pivoted commission, combining the fees and interest
+        -- bases (the four columns the dashboard pivots from).
         COALESCE(SUM(CASE WHEN e.role = 'brought_in' THEN
             (e.fees + e.interest) * COALESCE(u.brought_in, 0) * COALESCE(u.multiple, 1)
         ELSE 0 END), 0)                  AS introduced,
@@ -200,7 +219,38 @@ per_staff_month AS (
                                      AND e.month_start > (e.account_opened
                                                           + (u.introducer_months || ' months')::interval)::date)
                           THEN (e.fees + e.interest) * COALESCE(u.introducer, 0) * COALESCE(u.multiple, 1)
-                          ELSE 0 END), 0) AS external
+                          ELSE 0 END), 0) AS external,
+        -- Commission split by base (fees vs interest), summed across
+        -- all four roles. commission_on_fees + commission_on_interest
+        -- = introduced + managing + supervising + external.
+        COALESCE(SUM(
+            e.fees
+            * COALESCE(CASE e.role
+                WHEN 'brought_in' THEN u.brought_in
+                WHEN 'managed'    THEN u.managed
+                WHEN 'supervised' THEN u.supervised
+                WHEN 'introducer' THEN u.introducer
+              END, 0)
+            * COALESCE(u.multiple, 1)
+            * CASE WHEN e.role = 'introducer'
+                    AND COALESCE(u.introducer_months, 0) > 0
+                    AND e.month_start > (e.account_opened + (u.introducer_months || ' months')::interval)::date
+                   THEN 0 ELSE 1 END
+        ), 0) AS commission_on_fees,
+        COALESCE(SUM(
+            e.interest
+            * COALESCE(CASE e.role
+                WHEN 'brought_in' THEN u.brought_in
+                WHEN 'managed'    THEN u.managed
+                WHEN 'supervised' THEN u.supervised
+                WHEN 'introducer' THEN u.introducer
+              END, 0)
+            * COALESCE(u.multiple, 1)
+            * CASE WHEN e.role = 'introducer'
+                    AND COALESCE(u.introducer_months, 0) > 0
+                    AND e.month_start > (e.account_opened + (u.introducer_months || ' months')::interval)::date
+                   THEN 0 ELSE 1 END
+        ), 0) AS commission_on_interest
     FROM staff_currency_months scm
     LEFT JOIN exploded e
       ON e.month_start = scm.month_start
@@ -210,6 +260,33 @@ per_staff_month AS (
       ON lower(u.email) = scm.staff_email
     GROUP BY scm.month_start, scm.staff_email, scm.currency,
              u.display, u.type, u.multiple, u.min_threshold
+),
+-- Qualifying revenue bases for this (staff, month, currency).
+-- Each account contributes its fees and interest ONCE per staff,
+-- regardless of how many of the four attribution slots the staff
+-- fills on it (otherwise threshold maths over-counts). This is the
+-- base the £15,875 quarterly threshold tests against.
+qualifying AS (
+    SELECT
+        month_start, currency, staff_email,
+        SUM(fees)     AS qualifying_fees,
+        SUM(interest) AS qualifying_interest
+    FROM (
+        SELECT DISTINCT
+            am.month_start,
+            am.currency,
+            lower(s.staff_member) AS staff_email,
+            am.account_id,
+            am.fees,
+            am.interest
+        FROM account_month am
+        CROSS JOIN LATERAL (
+            VALUES (am.dp_introduced), (am.dp_managing),
+                   (am.dp_supervising), (am.ext_introducer)
+        ) AS s(staff_member)
+        WHERE s.staff_member IS NOT NULL
+    ) deduped
+    GROUP BY month_start, currency, staff_email
 ),
 -- Tag each row with the period dimensions and the within-row total.
 with_periods AS (
@@ -268,9 +345,16 @@ with_periods AS (
         END                                                AS commission_payable_on,
         p.staff_email, p.staff_name, p.staff_type, p.currency,
         p.commission_multiple, p.quarterly_threshold,
+        COALESCE(q.qualifying_fees,     0) AS qualifying_fees,
+        COALESCE(q.qualifying_interest, 0) AS qualifying_interest,
         p.introduced, p.managing, p.supervising, p.external,
+        p.commission_on_fees, p.commission_on_interest,
         (p.introduced + p.managing + p.supervising + p.external) AS month_total
     FROM per_staff_month p
+    LEFT JOIN qualifying q
+      ON q.month_start = p.month_start
+     AND q.staff_email = p.staff_email
+     AND q.currency    = p.currency
 ),
 final AS (
     SELECT
@@ -280,7 +364,10 @@ final AS (
         currency,
         staff_email, staff_name, staff_type,
         commission_multiple, quarterly_threshold,
-        introduced, managing, supervising, external, month_total,
+        qualifying_fees, qualifying_interest,
+        introduced, managing, supervising, external,
+        commission_on_fees, commission_on_interest,
+        month_total,
         SUM(month_total) OVER (
             PARTITION BY staff_email, currency
             ORDER BY month_start
@@ -316,15 +403,19 @@ SELECT
     currency,
     staff_email, staff_name, staff_type,
     commission_multiple, quarterly_threshold,
-    ROUND(introduced::numeric,      4) AS introduced,
-    ROUND(managing::numeric,        4) AS managing,
-    ROUND(supervising::numeric,     4) AS supervising,
-    ROUND(external::numeric,        4) AS external,
-    ROUND(month_total::numeric,     4) AS month_total,
-    ROUND(cumulative::numeric,      4) AS cumulative,
-    ROUND(fy_to_date::numeric,      4) AS fy_to_date,
-    ROUND(quarter_to_date::numeric, 4) AS quarter_to_date,
-    ROUND(total_paid::numeric,      4) AS total_paid,
+    ROUND(qualifying_fees::numeric,     4) AS qualifying_fees,
+    ROUND(qualifying_interest::numeric, 4) AS qualifying_interest,
+    ROUND(introduced::numeric,          4) AS introduced,
+    ROUND(managing::numeric,            4) AS managing,
+    ROUND(supervising::numeric,         4) AS supervising,
+    ROUND(external::numeric,            4) AS external,
+    ROUND(commission_on_fees::numeric,     4) AS commission_on_fees,
+    ROUND(commission_on_interest::numeric, 4) AS commission_on_interest,
+    ROUND(month_total::numeric,         4) AS month_total,
+    ROUND(cumulative::numeric,          4) AS cumulative,
+    ROUND(fy_to_date::numeric,          4) AS fy_to_date,
+    ROUND(quarter_to_date::numeric,     4) AS quarter_to_date,
+    ROUND(total_paid::numeric,          4) AS total_paid,
     ROUND((cumulative - total_paid)::numeric, 4) AS to_pay
 FROM final
 ORDER BY staff_email, currency, month_start;
