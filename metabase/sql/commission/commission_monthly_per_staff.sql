@@ -8,9 +8,13 @@
 -- A "commission recipient" is anyone who EITHER appears in
 -- sys_commission_users OR is named in a dp_account attribution slot
 -- (dp_introduced / dp_managing / dp_supervising / ext_introducer).
--- The cross join below ensures recipients show up in every month from
--- the plan effective date even when they earned zero, so the dashboard
--- can render an unbroken time series per person.
+--
+-- Each recipient appears in every month from when they became
+-- eligible (sys_commission_users.from_date) through to the current
+-- month, even when they earned zero, so the dashboard can render
+-- an unbroken time series per person. Attribution-only staff (not
+-- in sys_commission_users) appear in every month so they remain
+-- visible as needing rate configuration.
 --
 -- The underlying calculation chain is identical to
 -- commission_super_query.sql (which exposes the same data at row
@@ -125,9 +129,19 @@ all_staff AS (
     SELECT DISTINCT lower(email)       AS staff_email FROM sys_commission_users
 ),
 staff_months AS (
+    -- One row per (staff, month) that the staff was eligible in.
+    -- A staff who has a from_date on sys_commission_users only appears
+    -- from that date onwards (so new starters do not carry years of
+    -- empty rows behind them). Attribution-only staff with no
+    -- sys_commission_users row appear in every month so they remain
+    -- visible as "configured for attribution but missing from
+    -- sys_commission_users".
     SELECT m.month_start, s.staff_email
     FROM months m
     CROSS JOIN all_staff s
+    LEFT JOIN sys_commission_users u ON lower(u.email) = s.staff_email
+    WHERE u.from_date IS NULL
+       OR m.month_start >= u.from_date
 ),
 -- Pivot to per-staff-per-month with four role-typed commission columns.
 per_staff_month AS (
