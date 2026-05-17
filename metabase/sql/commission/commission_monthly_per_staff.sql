@@ -38,6 +38,15 @@
 --   fy_to_date     running sum within each plan FY (resets each Dec)
 --   quarter_to_date running sum within each plan quarter (resets each
 --                   plan quarter)
+--   total_paid     sum of every comm_paid.amount to this recipient
+--                  where comm_paid.date <= month_end. Includes any
+--                  pre-plan-effective payments, so the running
+--                  balance starts from a complete payment history.
+--   to_pay         cumulative - total_paid. Naturally signed: a
+--                  negative value means the recipient has been paid
+--                  more than the dashboard has recorded as earned
+--                  (e.g. fees not yet linked through dp_account,
+--                  pre-plan invoices, or genuine overpayment).
 -- =====================================================================
 
 WITH params AS (
@@ -207,6 +216,38 @@ with_periods AS (
         p.introduced, p.managing, p.supervising, p.external,
         (p.introduced + p.managing + p.supervising + p.external) AS month_total
     FROM per_staff_month p
+),
+final AS (
+    SELECT
+        month_start, month_end, month_label,
+        plan_fy_year, plan_quarter_num, plan_quarter_label,
+        plan_quarter_start, plan_quarter_end, plan_payable_date,
+        staff_email, staff_name, staff_type,
+        commission_multiple, quarterly_threshold,
+        introduced, managing, supervising, external, month_total,
+        SUM(month_total) OVER (
+            PARTITION BY staff_email
+            ORDER BY month_start
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cumulative,
+        SUM(month_total) OVER (
+            PARTITION BY staff_email, plan_fy_year
+            ORDER BY month_start
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS fy_to_date,
+        SUM(month_total) OVER (
+            PARTITION BY staff_email, plan_quarter_label
+            ORDER BY month_start
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS quarter_to_date,
+        -- Total commission paid out to this recipient on or before
+        -- the end of this month, across the entire comm_paid table.
+        (SELECT COALESCE(SUM(amount), 0)
+           FROM comm_paid cp
+           WHERE lower(cp.paid_to) = wp.staff_email
+             AND cp.date::date <= wp.month_end
+        ) AS total_paid
+    FROM with_periods wp
 )
 SELECT
     month_start, month_end, month_label,
@@ -214,25 +255,15 @@ SELECT
     plan_quarter_start, plan_quarter_end, plan_payable_date,
     staff_email, staff_name, staff_type,
     commission_multiple, quarterly_threshold,
-    ROUND(introduced::numeric,  4)     AS introduced,
-    ROUND(managing::numeric,    4)     AS managing,
-    ROUND(supervising::numeric, 4)     AS supervising,
-    ROUND(external::numeric,    4)     AS external,
-    ROUND(month_total::numeric, 4)     AS month_total,
-    ROUND(SUM(month_total) OVER (
-        PARTITION BY staff_email
-        ORDER BY month_start
-        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    )::numeric, 4)                     AS cumulative,
-    ROUND(SUM(month_total) OVER (
-        PARTITION BY staff_email, plan_fy_year
-        ORDER BY month_start
-        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    )::numeric, 4)                     AS fy_to_date,
-    ROUND(SUM(month_total) OVER (
-        PARTITION BY staff_email, plan_quarter_label
-        ORDER BY month_start
-        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    )::numeric, 4)                     AS quarter_to_date
-FROM with_periods
+    ROUND(introduced::numeric,      4) AS introduced,
+    ROUND(managing::numeric,        4) AS managing,
+    ROUND(supervising::numeric,     4) AS supervising,
+    ROUND(external::numeric,        4) AS external,
+    ROUND(month_total::numeric,     4) AS month_total,
+    ROUND(cumulative::numeric,      4) AS cumulative,
+    ROUND(fy_to_date::numeric,      4) AS fy_to_date,
+    ROUND(quarter_to_date::numeric, 4) AS quarter_to_date,
+    ROUND(total_paid::numeric,      4) AS total_paid,
+    ROUND((cumulative - total_paid)::numeric, 4) AS to_pay
+FROM final
 ORDER BY staff_email, month_start;
