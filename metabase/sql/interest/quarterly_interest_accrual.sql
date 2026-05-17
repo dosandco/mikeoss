@@ -24,26 +24,21 @@
 --   - effective_carry            interest-weighted average of daily_carry
 --   - dp_interest                firm's share = SUM(daily_interest * daily_carry)
 --
--- IMPORTANT - quarter-bucket labels
--- ---------------------------------
--- The bucketing expression DATE_TRUNC('quarter', day + interval '1 month')
--- groups days into three-month windows that ARE NOT the calendar
--- quarters that quarter_start / quarter_end name. The bucket key
--- for a date d is the start of the calendar quarter containing
--- d + 1 month, which means each bucket contains the LAST month of
--- one calendar quarter plus the first two months of the next. So:
+-- Quarter buckets
+-- ---------------
+-- Buckets are standard calendar quarters: a day in Jan/Feb/Mar is
+-- attributed to the quarter ending 31 Mar, Apr/May/Jun to 30 Jun,
+-- Jul/Aug/Sep to 30 Sep, Oct/Nov/Dec to 31 Dec. Bucketing key is
+-- DATE_TRUNC('quarter', day). The prior version used
+-- DATE_TRUNC('quarter', day + interval '1 month'), which labelled
+-- each bucket with the calendar quarter immediately BEFORE its
+-- membership (e.g. Apr-Jun days were stamped quarter_end = Mar 31).
+-- Upsert keys include quarter_end so the next refresh after deploy
+-- will overwrite the old mislabelled rows in int_quarterly.
 --
---    Days in Mar/Apr/May  ->  bucket labelled quarter_end = Mar 31
---    Days in Jun/Jul/Aug  ->  bucket labelled quarter_end = Jun 30
---    Days in Sep/Oct/Nov  ->  bucket labelled quarter_end = Sep 30
---    Days in Dec/Jan/Feb  ->  bucket labelled quarter_end = Dec 31
---
--- The labels (quarter_start, quarter_end) point at the calendar
--- quarter immediately BEFORE the bucket's membership. This matches
--- the existing int_quarterly rows in production, so the behaviour
--- is preserved here. If the labelling is ever revisited, swap to
--- `DATE_TRUNC('quarter', day)` and recompute quarter_end as
--- bucket_key + interval '3 months - 1 day'.
+-- payable is the last day of the second calendar month following
+-- quarter_end, matching the commission-plan timing rule (e.g. Q1
+-- ends 31 Mar -> payable 31 May).
 --
 -- See metabase/sql/interest/monthly_interest_accrual.sql for the
 -- full notes on join model, rate lookup, day-count conventions and
@@ -67,12 +62,11 @@
 -- =====================================================================
 
 WITH params AS (
-    -- series_start: start of the membership range of the bucket that
-    -- contains "12 months ago" so the leading bucket is complete.
+    -- series_start: first day of the calendar quarter that contains
+    -- "12 months ago" so the leading bucket is complete.
     SELECT
-        (DATE_TRUNC('quarter', (current_date - interval '12 months') + interval '1 month')
-            - interval '1 month')::date                              AS series_start,
-        (current_date - interval '1 day')::date                      AS series_end
+        DATE_TRUNC('quarter', current_date - interval '12 months')::date AS series_start,
+        (current_date - interval '1 day')::date                          AS series_end
 ),
 calendar AS (
     SELECT d::date AS day
@@ -195,9 +189,9 @@ daily_interest AS (
 ),
 quarterly_aggregate AS (
     SELECT
-        (DATE_TRUNC('quarter', day + interval '1 month') - interval '3 months')::date AS quarter_start,
-        (DATE_TRUNC('quarter', day + interval '1 month') - interval '1 day')::date    AS quarter_end,
-        (DATE_TRUNC('quarter', day + interval '1 month') + interval '2 months' - interval '1 day')::date AS payable,
+        DATE_TRUNC('quarter', day)::date                                                AS quarter_start,
+        (DATE_TRUNC('quarter', day) + interval '3 months' - interval '1 day')::date     AS quarter_end,
+        (DATE_TRUNC('quarter', day) + interval '5 months' - interval '1 day')::date     AS payable,
         day, account_id, bank, currency, genre,
         dp_introduced, dp_managing, dp_supervising,
         end_of_day_balance, transactions_today, daily_interest, daily_carry,
@@ -205,17 +199,15 @@ quarterly_aggregate AS (
         SUM(daily_interest * daily_carry)    OVER w_q AS quarterly_dp_interest,
         SUM(transactions_today)              OVER w_q AS quarterly_transactions,
         COUNT(*)                             OVER w_q AS days_present_in_quarter,
-        -- Calendar days in the bucket's MEMBERSHIP range (the three
-        -- months that actually contribute), not in the label range.
-        ((DATE_TRUNC('quarter', day + interval '1 month') + interval '2 months')::date
-            - (DATE_TRUNC('quarter', day + interval '1 month') - interval '1 month')::date) AS calendar_days_in_quarter,
+        ((DATE_TRUNC('quarter', day) + interval '3 months')::date
+            - DATE_TRUNC('quarter', day)::date) AS calendar_days_in_quarter,
         ROW_NUMBER() OVER (
-            PARTITION BY account_id, genre, bank, currency, DATE_TRUNC('quarter', day + interval '1 month')
+            PARTITION BY account_id, genre, bank, currency, DATE_TRUNC('quarter', day)
             ORDER BY day DESC
         ) AS rn
     FROM daily_interest
     WINDOW w_q AS (
-        PARTITION BY account_id, genre, bank, currency, DATE_TRUNC('quarter', day + interval '1 month')
+        PARTITION BY account_id, genre, bank, currency, DATE_TRUNC('quarter', day)
     )
 )
 SELECT
