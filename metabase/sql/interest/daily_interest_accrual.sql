@@ -1,13 +1,12 @@
 -- =====================================================================
 -- Daily interest accrual per dp_account x commercial bank x currency.
 --
--- One row per (day, account, bank, currency) over the trailing 12
--- months. Same calculation chain as monthly_interest_accrual.sql but
--- without the monthly aggregation, so downstream consumers can pick
--- their own window (e.g. quarter for the commission plan).
+-- Designed to be run once a day as a nightly job: produces one row
+-- per (account, bank, currency) for YESTERDAY only and is intended to
+-- be appended to whatever daily-history table the firm keeps.
 --
 -- Output columns
---   - day                        calendar date
+--   - day                        the as-of date (always yesterday)
 --   - account_id                 dp_account.id
 --   - bank                       commercial bank (bol / cb / fh / ...)
 --   - currency                   account currency (from bank_account_sub)
@@ -29,11 +28,13 @@
 -- (currency_conventions, cb_rules); edit them in lockstep when
 -- commercial terms change.
 --
+-- Backfilling
+--   The params CTE pins both ends of the date range to yesterday. To
+--   backfill a different day, change params.as_of_date. To backfill a
+--   range, replace the single-row params with a generate_series over
+--   the dates you want.
+--
 -- Source-query changes incorporated in this version
---   * Series start moved from "yesterday" (the prior version's
---     generate_series collapsed to a single day because the lower
---     bound was current_date - 1 day - 0 days) to the first of the
---     month 12 months ago.
 --   * postingDate::date -> bank_transaction.valueDate (proper date
 --     column, conventional basis for ACT/N interest accrual).
 --   * carry CASE now has an explicit ELSE 0 so accounts with NULL
@@ -44,14 +45,13 @@
 -- =====================================================================
 
 WITH params AS (
-    SELECT
-        date_trunc('month', current_date - interval '12 months')::date AS series_start,
-        (current_date - interval '1 day')::date                        AS series_end
+    -- Single as-of date for the nightly run. Defaults to yesterday so
+    -- the previous calendar day's closing balance and interest are
+    -- captured once and never again.
+    SELECT (current_date - interval '1 day')::date AS as_of_date
 ),
 calendar AS (
-    SELECT d::date AS day
-    FROM params,
-         generate_series(params.series_start, params.series_end, interval '1 day') AS d
+    SELECT as_of_date AS day FROM params
 ),
 -- Day-count basis per currency for ACT/N interest calculations.
 currency_conventions AS (
